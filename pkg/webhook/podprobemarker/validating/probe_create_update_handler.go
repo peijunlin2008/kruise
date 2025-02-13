@@ -24,11 +24,11 @@ import (
 	"regexp"
 	"strings"
 
+	"k8s.io/apimachinery/pkg/util/intstr"
+
 	"github.com/openkruise/kruise/pkg/features"
 	utilfeature "github.com/openkruise/kruise/pkg/util/feature"
 
-	"github.com/openkruise/kruise/apis/apps/pub"
-	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
 	genericvalidation "k8s.io/apimachinery/pkg/api/validation"
@@ -38,9 +38,10 @@ import (
 	validationutil "k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	"k8s.io/kubernetes/pkg/apis/core/validation"
-	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/runtime/inject"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+
+	"github.com/openkruise/kruise/apis/apps/pub"
+	appsv1alpha1 "github.com/openkruise/kruise/apis/apps/v1alpha1"
 )
 
 const (
@@ -59,7 +60,7 @@ var (
 // PodProbeMarkerCreateUpdateHandler handles PodProbeMarker
 type PodProbeMarkerCreateUpdateHandler struct {
 	// Decoder decodes objects
-	Decoder *admission.Decoder
+	Decoder admission.Decoder
 }
 
 var _ admission.Handler = &PodProbeMarkerCreateUpdateHandler{}
@@ -172,7 +173,7 @@ func validatePodProbeMarkerSpec(obj *appsv1alpha1.PodProbeMarker, fldPath *field
 
 func validateSelector(selector *metav1.LabelSelector, fldPath *field.Path) field.ErrorList {
 	allErrs := field.ErrorList{}
-	allErrs = append(allErrs, metavalidation.ValidateLabelSelector(selector, fldPath)...)
+	allErrs = append(allErrs, metavalidation.ValidateLabelSelector(selector, metavalidation.LabelSelectorValidationOptions{}, fldPath)...)
 	if len(selector.MatchLabels)+len(selector.MatchExpressions) == 0 {
 		allErrs = append(allErrs, field.Invalid(fldPath, selector, "empty selector is not valid for podProbeMarker."))
 	}
@@ -202,13 +203,30 @@ func validateHandler(handler *corev1.ProbeHandler, fldPath *field.Path) field.Er
 	numHandlers := 0
 	allErrors := field.ErrorList{}
 	if handler.Exec != nil {
-		numHandlers++
-		allErrors = append(allErrors, validateExecAction(handler.Exec, fldPath.Child("exec"))...)
+		if numHandlers > 0 {
+			allErrors = append(allErrors, field.Forbidden(fldPath.Child("exec"), "may not specify more than 1 handler type"))
+		} else {
+			numHandlers++
+			allErrors = append(allErrors, validateExecAction(handler.Exec, fldPath.Child("exec"))...)
+		}
 	}
-	if handler.HTTPGet != nil || handler.TCPSocket != nil {
-		numHandlers++
-		allErrors = append(allErrors, field.Forbidden(fldPath.Child("probe"), "current only support exec probe"))
+	if handler.HTTPGet != nil {
+		if numHandlers > 0 {
+			allErrors = append(allErrors, field.Forbidden(fldPath.Child("httpGet"), "may not specify more than 1 handler type"))
+		} else {
+			numHandlers++
+			allErrors = append(allErrors, field.Forbidden(fldPath.Child("probe"), "current no support http probe"))
+		}
 	}
+	if handler.TCPSocket != nil {
+		if numHandlers > 0 {
+			allErrors = append(allErrors, field.Forbidden(fldPath.Child("tcpSocket"), "may not specify more than 1 handler type"))
+		} else {
+			numHandlers++
+			allErrors = append(allErrors, validateTCPSocketAction(handler.TCPSocket, fldPath.Child("tcpSocket"))...)
+		}
+	}
+
 	if numHandlers == 0 {
 		allErrors = append(allErrors, field.Required(fldPath, "must specify a handler type"))
 	}
@@ -221,6 +239,26 @@ func validateExecAction(exec *corev1.ExecAction, fldPath *field.Path) field.Erro
 		allErrors = append(allErrors, field.Required(fldPath.Child("command"), ""))
 	}
 	return allErrors
+}
+
+func validateTCPSocketAction(tcp *corev1.TCPSocketAction, fldPath *field.Path) field.ErrorList {
+	return ValidatePortNumOrName(tcp.Port, fldPath.Child("port"))
+}
+
+func ValidatePortNumOrName(port intstr.IntOrString, fldPath *field.Path) field.ErrorList {
+	allErrs := field.ErrorList{}
+	if port.Type == intstr.Int {
+		for _, msg := range validationutil.IsValidPortNum(port.IntValue()) {
+			allErrs = append(allErrs, field.Invalid(fldPath, port.IntValue(), msg))
+		}
+	} else if port.Type == intstr.String {
+		for _, msg := range validationutil.IsValidPortName(port.StrVal) {
+			allErrs = append(allErrs, field.Invalid(fldPath, port.StrVal, msg))
+		}
+	} else {
+		allErrs = append(allErrs, field.InternalError(fldPath, fmt.Errorf("unknown type: %v", port.Type)))
+	}
+	return allErrs
 }
 
 func validateProbeMarkerPolicy(policy *appsv1alpha1.ProbeMarkerPolicy, fldPath *field.Path) field.ErrorList {
@@ -247,19 +285,4 @@ func validatePodProbeMarkerName(name string, prefix bool) (allErrs []string) {
 		allErrs = append(allErrs, validationutil.MaxLenError(nameMaxLen))
 	}
 	return allErrs
-}
-
-var _ inject.Client = &PodProbeMarkerCreateUpdateHandler{}
-
-// InjectClient injects the client into the PodProbeMarkerCreateUpdateHandler
-func (h *PodProbeMarkerCreateUpdateHandler) InjectClient(c client.Client) error {
-	return nil
-}
-
-var _ admission.DecoderInjector = &PodProbeMarkerCreateUpdateHandler{}
-
-// InjectDecoder injects the decoder into the PodProbeMarkerCreateUpdateHandler
-func (h *PodProbeMarkerCreateUpdateHandler) InjectDecoder(d *admission.Decoder) error {
-	h.Decoder = d
-	return nil
 }
